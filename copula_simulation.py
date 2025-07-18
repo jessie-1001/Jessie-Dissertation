@@ -13,10 +13,20 @@ import warnings
 from scipy.linalg import cholesky
 from scipy.optimize import minimize
 import pickle
+from scipy.stats import t as student_t
+from scipy.optimize import minimize
+from scipy import stats
+from joblib import Parallel, delayed
 
 warnings.filterwarnings('ignore')
 
 # --- 1. STABLE COPULA SAMPLERS ---
+def calc_min_var_weights(vol_spx, vol_eurusd, rho):
+    var_spx, var_eu = vol_spx**2, vol_eurusd**2
+    cov = rho * vol_spx * vol_eurusd
+    w_spx = (var_eu - cov) / (var_spx + var_eu - 2*cov)
+    w_spx = np.clip(w_spx, 0.2, 0.8)
+    return w_spx, 1 - w_spx
 
 def sample_gaussian_copula(n_samples, corr_matrix):
     """Robust Gaussian copula sampling using Cholesky decomposition."""
@@ -66,18 +76,40 @@ def sample_gumbel_copula(n_samples, theta):
     u2_sim = np.exp(-e2**(1/theta))
     return np.column_stack((u1_sim, u2_sim))
 
+def sample_survival_gumbel_copula(n_samples, theta):
+    """下尾 Gumbel：先采样上尾，再做 (1‑u, 1‑v) 旋转"""
+    return 1 - sample_gumbel_copula(n_samples, theta)
+
+def sample_survival_clayton_copula(n_samples, theta):
+    """下尾 Clayton，同理旋转"""
+    return 1 - sample_clayton_copula(n_samples, theta)
 # --- 2. ROBUST PARAMETER ESTIMATION ---
 
+
+
 def fit_t_copula_mle(data):
-    """Robust t-copula parameter estimation with simplified approach."""
-    # 使用Kendall's tau作为相关系数估计
-    kendall_tau = data.corr(method='kendall').iloc[0, 1]
-    rho = np.sin(np.pi * kendall_tau / 2)
-    
-    # 固定自由度参数
-    df = 6.0
-    
-    return {'corr_matrix': np.array([[1, rho], [rho, 1]]), 'df': df}
+    """Full MLE for bivariate t‑Copula (ρ, ν).  ## MOD"""
+    u = data.values
+
+    def neg_ll(params):
+        rho, df = params
+        # 约束：|ρ|<0.99, ν>2
+        if abs(rho) >= .99 or df <= 2.1:
+            return np.inf
+        c = np.array([[1, rho], [rho, 1]])
+        inv_c = np.linalg.inv(c)
+        det_c = np.linalg.det(c)
+        z = student_t.ppf(u, df=df)
+        quad = np.einsum('ij,jk,ik->i', z, inv_c, z)
+        ll = -0.5*np.log(det_c) - (df+2)/2*np.log1p(quad/df) \
+             + student_t.logpdf(z, df=df).sum(axis=1)
+        return -ll.sum()
+
+    kendall_tau = data.corr('kendall').iloc[0,1]
+    rho0 = np.sin(np.pi*kendall_tau/2)
+    res = minimize(neg_ll, [rho0, 8], bounds=[(-0.95,0.95),(2.1,20)])
+    rho_hat, df_hat = res.x
+    return {'corr_matrix': np.array([[1, rho_hat],[rho_hat,1]]), 'df': df_hat}
 
 def get_copula_parameters(data, silent=False):
     """Estimates dependence parameters with improved stability."""
@@ -136,12 +168,7 @@ def fit_garch_model(returns, model_type, max_retries=3):
                 # 优化器设置
                 res = model.fit(
                     disp='off', 
-                    options={
-                        'maxiter': 1000, 
-                        'ftol': 1e-5, 
-                        'gtol': 1e-5,
-                        'maxfun': 5000
-                    },
+                    options={'maxiter': 1000, 'ftol': 1e-5},
                     update_freq=0
                 )
             else:  # EURUSD
@@ -156,12 +183,7 @@ def fit_garch_model(returns, model_type, max_retries=3):
                 )
                 res = model.fit(
                     disp='off', 
-                    options={
-                        'maxiter': 1000, 
-                        'ftol': 1e-5, 
-                        'gtol': 1e-5,
-                        'maxfun': 5000
-                    },
+                    options={'maxiter': 1000, 'ftol': 1e-5},
                     update_freq=0
                 )
             return res
@@ -193,7 +215,7 @@ def calculate_dynamic_weights(vol_spx, vol_eurusd):
 
 # --- 4. OPTIMIZED SIMULATION FUNCTION WITH GARCH ---
 
-def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=10000):
+def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=50000):
     """GARCH-based Monte Carlo simulation with stability improvements."""
     window_data = full_data.loc[:t_index]
     
@@ -215,7 +237,10 @@ def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=1000
         sigma_t1_eurusd = res_eurusd.conditional_volatility[-1]
     
     # 计算动态权重
-    weight_spx, weight_eurusd = calculate_dynamic_weights(sigma_t1_spx, sigma_t1_eurusd)
+    rho_today = copula_params['Gaussian']['corr_matrix'][0,1]
+    weight_spx, weight_eurusd = calc_min_var_weights(sigma_t1_spx,
+                                                     sigma_t1_eurusd,
+                                                     rho_today)
     
     # 简化均值预测 - 使用0均值假设提高稳定性
     mu_spx_next = 0
@@ -225,8 +250,8 @@ def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=1000
     samplers = {
         'Gaussian': lambda n, p: sample_gaussian_copula(n, p['corr_matrix']),
         'StudentT': lambda n, p: sample_t_copula(n, p['corr_matrix'], p['df']),
-        'Gumbel': lambda n, p: sample_gumbel_copula(n, p['theta']),
-        'Clayton': lambda n, p: sample_clayton_copula(n, p['theta'])
+        'Gumbel': lambda n, p: sample_survival_gumbel_copula(n, p['theta']),
+        'Clayton': lambda n, p: sample_survival_clayton_copula(n, p['theta'])
     }
     
     # 获取自由度参数 - 添加默认值
@@ -254,7 +279,13 @@ def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=1000
             # 计算VaR和ES - 添加裁剪避免极端值
             r_portfolio_sim = np.clip(r_portfolio_sim, -0.5, 0.5)  # 限制在±50%范围内
             var_99 = np.percentile(r_portfolio_sim, 1)
-            es_99 = r_portfolio_sim[r_portfolio_sim <= var_99].mean()
+            exceed = var_99 - r_portfolio_sim[r_portfolio_sim <= var_99]  # 正值超损
+            if exceed.size > 30:                       ## FIX EVT
+                shape, loc, scale = stats.genpareto.fit(exceed, floc=0)
+                # 理论: ES = VaR + (scale + shape*VaR_exceed_mean)/(1‑shape)
+                es_99 = var_99 - (scale + shape*exceed.mean()) / (1 - shape)
+            else:
+                es_99 = r_portfolio_sim[r_portfolio_sim <= var_99].mean()
             
             daily_forecasts[name] = {
                 'VaR_99': var_99, 
@@ -307,34 +338,25 @@ if __name__ == '__main__':
         # 进行滚动预测
         all_forecasts = []
         
-        for day in tqdm(forecast_dates, desc="Forecasting VaR/ES"):
-            try:
-                # 获取前一日的索引
-                t_index = full_data.index[full_data.index.get_loc(day) - 1]
-                forecasts = run_simulation_for_day(t_index, full_data, copula_params)
-                
-                flat_forecasts = {'Date': day}
-                for model_name, values in forecasts.items():
-                    flat_forecasts[f'{model_name}_VaR_99'] = values['VaR_99']
-                    flat_forecasts[f'{model_name}_ES_99'] = values['ES_99']
-                    flat_forecasts[f'{model_name}_Weight_SPX'] = values['Weight_SPX']
-                    flat_forecasts[f'{model_name}_Weight_EURUSD'] = values['Weight_EURUSD']
-                    flat_forecasts[f'{model_name}_Vol_SPX'] = values['Vol_SPX']
-                    flat_forecasts[f'{model_name}_Vol_EURUSD'] = values['Vol_EURUSD']
-                all_forecasts.append(flat_forecasts)
-            except Exception as e:
-                print(f"Failed for date {day}: {e}")
-                # 添加空值占位符
-                flat_forecasts = {'Date': day}
-                for model_name in copula_params.keys():
-                    flat_forecasts[f'{model_name}_VaR_99'] = np.nan
-                    flat_forecasts[f'{model_name}_ES_99'] = np.nan
-                    flat_forecasts[f'{model_name}_Weight_SPX'] = np.nan
-                    flat_forecasts[f'{model_name}_Weight_EURUSD'] = np.nan
-                    flat_forecasts[f'{model_name}_Vol_SPX'] = np.nan
-                    flat_forecasts[f'{model_name}_Vol_EURUSD'] = np.nan
-                all_forecasts.append(flat_forecasts)
-                continue
+        def _one_day(day):
+            t_idx = full_data.index[full_data.index.get_loc(day) - 1]
+            forecasts = run_simulation_for_day(t_idx, full_data,
+                                            copula_params,
+                                            n_simulations=50000)
+            flat = {'Date': day}
+            for model, vals in forecasts.items():
+                flat[f'{model}_VaR_99']       = vals['VaR_99']
+                flat[f'{model}_ES_99']        = vals['ES_99']
+                flat[f'{model}_Weight_SPX']   = vals['Weight_SPX']
+                flat[f'{model}_Weight_EURUSD']= vals['Weight_EURUSD']
+                flat[f'{model}_Vol_SPX']      = vals['Vol_SPX']
+                flat[f'{model}_Vol_EURUSD']   = vals['Vol_EURUSD']
+            return flat
+
+        # 并行执行；prefer="threads" 可以避免多进程拷贝开销
+        all_forecasts = Parallel(n_jobs=8, prefer="threads")(
+            delayed(_one_day)(d) for d in tqdm(forecast_dates,
+                                            desc="Forecasting VaR/ES"))
 
         # 保存预测结果
         forecasts_df = pd.DataFrame(all_forecasts).set_index('Date')
